@@ -15,8 +15,6 @@
       createTextTracksIfNecessary,
       addTextTrackData;
 
-Cue = window.WebKitDataCue || window.VTTCue;
-
 deprecateOldCue = function(cue) {
   Object.defineProperties(cue.frame, {
     'id': {
@@ -64,7 +62,7 @@ createTextTracksIfNecessary = function (sourceBuffer, mediaSource, segment) {
   if (segment.captions &&
       segment.captions.length &&
       !sourceBuffer.inbandTextTrack_) {
-    sourceBuffer.inbandTextTrack_ = mediaSource.player_.addTextTrack('captions');
+    sourceBuffer.inbandTextTrack_ = mediaSource.player_.addTextTrack('captions', 'cc1');
   }
 
   if (segment.metadata &&
@@ -76,10 +74,11 @@ createTextTracksIfNecessary = function (sourceBuffer, mediaSource, segment) {
 };
 
 addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
+  Cue = window.WebKitDataCue || window.VTTCue;
   if (captionArray) {
     captionArray.forEach(function (caption) {
       this.inbandTextTrack_.addCue(
-        new VTTCue(
+        new Cue(
           caption.startTime + this.timestampOffset,
           caption.endTime + this.timestampOffset,
           caption.text
@@ -134,8 +133,11 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
     return new videojs.FlashMediaSource();
   };
 
+  // Check to see if the native MediaSource object exists and supports
+  // an MP4 container with both H.264 video and AAC-LC audio
   videojs.MediaSource.supportsNativeMediaSources = function() {
-    return !!window.MediaSource;
+    return (!!window.MediaSource &&
+      window.MediaSource.isTypeSupported('video/mp4;codecs="avc1.4d400d,mp4a.40.2"'));
   };
 
   // ----
@@ -161,7 +163,11 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
       this.duration_ = NaN;
       Object.defineProperty(this, 'duration', {
         get: function() {
-          return self.duration_;
+          if (self.duration_ === Infinity) {
+            return self.duration_;
+          } else {
+            return self.mediaSource_.duration;
+          }
         },
         set: function(duration) {
           var currentDuration;
@@ -192,9 +198,18 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
       // MediaSource
       this.sourceBuffers = [];
 
+      // Re-emit MediaSource events on the polyfill
+      [
+        'sourceopen',
+        'sourceclose',
+        'sourceended'
+      ].forEach(function(eventName) {
+        this.mediaSource_.addEventListener(eventName, this.trigger.bind(this));
+      }, this);
+
       // capture the associated player when the MediaSource is
       // successfully attached
-      this.mediaSource_.addEventListener('sourceopen', function(event) {
+      this.on('sourceopen', function(event) {
         var video = document.querySelector('[src="' + self.url_ + '"]');
 
         if (!video) {
@@ -202,7 +217,18 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
         }
 
         self.player_ = videojs(video.parentNode);
-        self.trigger(event);
+      });
+
+      // explicitly terminate any WebWorkers that were created
+      // by SourceHandlers
+      this.on('sourceclose', function(event) {
+        this.sourceBuffers.forEach(function(sourceBuffer) {
+          if (sourceBuffer.transmuxer_) {
+            sourceBuffer.transmuxer_.terminate();
+          }
+        });
+
+        this.sourceBuffers.length = 0;
       });
     },
 
@@ -293,8 +319,6 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
       this.mediaSource_ = mediaSource;
       this.codecs_ = codecs;
 
-      // append muxed segments to their respective native buffers as
-      // soon as they are available
       this.transmuxer_ = new Worker(videojs.MediaSource.webWorkerURI || '/src/transmuxer_worker.js');
       this.transmuxer_.postMessage({action:'init', options: {remux: false}});
 
@@ -318,16 +342,12 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
           if (typeof val === 'number' && val >= 0) {
             this.timestampOffset_ = val;
 
-            if (this.videoBuffer_) {
-              this.videoBuffer_.timestampOffset = val;
-            }
-            if (this.audioBuffer_) {
-              this.audioBuffer_.timestampOffset = val;
-            }
-
-            // We have to tell the transmuxer to reset the baseMediaDecodeTime to
-            // zero for the next segment
-            this.transmuxer_.postMessage({action: 'resetTransmuxer'});
+            // We have to tell the transmuxer to set the baseMediaDecodeTime to
+            // the desired timestampOffset for the next segment
+            this.transmuxer_.postMessage({
+              action: 'setTimestampOffset',
+              timestampOffset: val
+            });
           }
         }
       });
@@ -438,14 +458,13 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
         segment = event.data.segment,
         nativeMediaSource = this.mediaSource_.mediaSource_;
 
-      // Cast to type
-      segment.data = new Uint8Array(segment.data);
+      // Cast ArrayBuffer to TypedArray
+      segment.data = new Uint8Array(segment.data, event.data.byteOffset, event.data.byteLength);
 
       // If any sourceBuffers have not been created, do so now
       if (segment.type === 'video') {
         if (!this.videoBuffer_) {
           this.videoBuffer_ = nativeMediaSource.addSourceBuffer('video/mp4;codecs="' + this.codecs_[0] + '"');
-          this.videoBuffer_.timestampOffset = this.timestampOffset_;
           // aggregate buffer events
           this.videoBuffer_.addEventListener('updatestart',
                                              aggregateUpdateHandler(this, 'audioBuffer_', 'updatestart'));
@@ -457,7 +476,6 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
       } else if (segment.type === 'audio') {
         if (!this.audioBuffer_) {
           this.audioBuffer_ = nativeMediaSource.addSourceBuffer('audio/mp4;codecs="' + this.codecs_[1] + '"');
-          this.audioBuffer_.timestampOffset = this.timestampOffset_;
           // aggregate buffer events
           this.audioBuffer_.addEventListener('updatestart',
                                              aggregateUpdateHandler(this, 'videoBuffer_', 'updatestart'));
@@ -469,7 +487,6 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
       } else if (segment.type === 'combined') {
         if (!this.videoBuffer_) {
           this.videoBuffer_ = nativeMediaSource.addSourceBuffer('video/mp4;codecs="' + this.codecs_.join(',') + '"');
-          this.videoBuffer_.timestampOffset = this.timestampOffset_;
           // aggregate buffer events
           this.videoBuffer_.addEventListener('updatestart',
                                              aggregateUpdateHandler(this, 'videoBuffer_', 'updatestart'));
@@ -498,7 +515,19 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
       // Start the internal "updating" state
       this.bufferUpdating_ = true;
 
-      this.transmuxer_.postMessage({action: 'push', data: segment.buffer}, [segment.buffer]);
+      this.transmuxer_.postMessage({
+        action: 'push',
+        // Send the typed-array of data as an ArrayBuffer so that
+        // it can be sent as a "Transferable" and avoid the costly
+        // memory copy
+        data: segment.buffer,
+
+        // To recreate the original typed-array, we need information
+        // about what portion of the ArrayBuffer it was a view into
+        byteOffset: segment.byteOffset,
+        byteLength: segment.byteLength
+      },
+      [segment.buffer]);
       this.transmuxer_.postMessage({action: 'flush'});
     },
     remove: function(start, end) {
@@ -604,7 +633,7 @@ addTextTrackData = function (sourceHandler, captionArray, metadataArray) {
         this.audioBuffer_.abort();
       }
       if (this.transmuxer_) {
-        this.transmuxer_.postMessage({action: 'resetTransmuxer'});
+        this.transmuxer_.postMessage({action: 'reset'});
       }
       this.pendingBuffers_.length = 0;
       this.bufferUpdating_ = false;

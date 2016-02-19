@@ -44,7 +44,35 @@
       },
       initializeNativeSourceBuffers,
       oldFlashTransmuxer,
-      MockSegmentParser;
+      MockSegmentParser,
+
+      // Create a WebWorker-style message that simulates data being emitted
+      // by the transmuxer
+      createDataMessage = function(type, typedArray, extraObject) {
+        var message = {
+          data: {
+            action: 'data',
+            segment: {
+              type: type,
+              data: typedArray.buffer
+            },
+            byteOffset: typedArray.byteOffset,
+            byteLength: typedArray.byteLength
+          }
+        };
+
+        return Object.keys(extraObject || {}).reduce(function (obj, key) {
+          obj.data.segment[key] = extraObject[key];
+          return obj;
+        }, message);
+      },
+
+      // Create a WebWorker-style message that signals the transmuxer is done
+      doneMessage = {
+        data: {
+          action: 'done'
+        }
+      };
 
   // Override default webWorkerURI for karma
   if (!videojs.MediaSource.webWorkerURI) {
@@ -69,12 +97,22 @@
         throw new Error('Testing Mock');
       }
     });
+    window.MediaSource.isTypeSupported = function (mime) {
+      return true;
+    };
+
     ok(new videojs.MediaSource({ mode: 'html5' }) instanceof videojs.HtmlMediaSource,
        'forced HTML5');
 
     // 'auto' should use native MediaSources when they're available
     ok(new videojs.MediaSource() instanceof videojs.HtmlMediaSource,
        'used HTML5');
+    window.MediaSource.isTypeSupported = function (mime) {
+      return false;
+    };
+     // 'auto' should use Flash MediaSources when isTypeSupported is false
+    ok(new videojs.MediaSource() instanceof videojs.FlashMediaSource,
+       'used Flash');
     window.MediaSource = null;
     // 'auto' should use Flash when native MediaSources are not available
     ok(new videojs.MediaSource({ mode: 'flash' }) instanceof videojs.FlashMediaSource,
@@ -99,6 +137,9 @@
           return buffer;
         }
       });
+      window.MediaSource.isTypeSupported = function(mime){
+        return true;
+      };
       window.WebKitMediaSource = window.MediaSource;
     },
     teardown: function(){
@@ -115,32 +156,13 @@
   // native source buffers
   initializeNativeSourceBuffers = function(sourceBuffer) {
     // initialize an audio source buffer
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'audio',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('audio', new Uint8Array(1)));
     // initialize a video source buffer
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'video',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('video', new Uint8Array(1)));
+
     // instruct the transmuxer to flush the "data" it has buffered so
     // far
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'done'
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(doneMessage);
   };
 
   test('creates mp4 source buffers for mp2t segments', function(){
@@ -161,6 +183,47 @@
           sourceBuffer,
           'returned the virtual buffer');
     ok(sourceBuffer.transmuxer_, 'created a transmuxer');
+  });
+
+  test('the terminate is called on the transmuxer when the media source is killed', function(){
+    var mediaSource = new videojs.MediaSource(),
+        sourceBuffer = mediaSource.addSourceBuffer('video/mp2t'),
+        messages = [],
+        terminates = 0;
+
+    initializeNativeSourceBuffers(sourceBuffer);
+
+    sourceBuffer.transmuxer_ = {
+      terminate: function() {
+        terminates++;
+      }
+    };
+
+    mediaSource.trigger('sourceclose');
+
+    equal(terminates, 1, 'called terminate on transmux web worker');
+  });
+
+
+  test('duration is faked when playing a live stream', function(){
+    var mediaSource = new videojs.MediaSource(),
+        sourceBuffer = mediaSource.addSourceBuffer('video/mp2t');
+
+    mediaSource.duration = Infinity;
+    mediaSource.mediaSource_.duration = 100;
+
+    equal(mediaSource.mediaSource_.duration, 100, 'native duration was not set to infinity');
+    equal(mediaSource.duration, Infinity, 'the MediaSource wrapper pretends it has an infinite duration');
+  });
+
+  test('duration uses the underlying MediaSource\'s duration when not live', function(){
+    var mediaSource = new videojs.MediaSource(),
+        sourceBuffer = mediaSource.addSourceBuffer('video/mp2t');
+
+    mediaSource.duration = 100;
+    mediaSource.mediaSource_.duration = 120;
+
+    equal(mediaSource.duration, 120, 'the MediaSource wrapper returns the native duration');
   });
 
   test('abort on the fake source buffer calls abort on the real ones', function(){
@@ -188,7 +251,7 @@
           false,
           'set updating to false');
     equal(messages.length, 1, 'has one message');
-    equal(messages[0].action, 'resetTransmuxer', 'reset called on transmuxer');
+    equal(messages[0].action, 'reset', 'reset called on transmuxer');
   });
 
   test('calling remove deletes cues and invokes remove on any extant source buffers', function(){
@@ -280,15 +343,7 @@
     equal(mp2tSegments[0][0], data[0], 'did not alter the segment');
 
     // an init segment
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'video',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('video', new Uint8Array(1)));
 
     // Source buffer is not created until after the muxer starts emitting data
     mediaSource.mediaSource_.sourceBuffers[0].appendBuffer = function(segment) {
@@ -296,28 +351,62 @@
     };
 
     // a media segment
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'video',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('audio', new Uint8Array(1)));
 
     // Segments are concatenated
     equal(mp4Segments.length, 0, 'segments are not appended until after the `done` message');
 
     // send `done` message
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'done',
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(doneMessage);
 
     // Segments are concatenated
     equal(mp4Segments.length, 1, 'appended the segments');
+  });
+
+  test('handles typed-arrays that are subsets of their underlying buffer', function(){
+    var
+      mp2tSegments = [],
+      mp4Segments = [],
+      buffer = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+      data = buffer.subarray(5, 7),
+      mediaSource,
+      sourceBuffer;
+    mediaSource = new videojs.MediaSource();
+    sourceBuffer = mediaSource.addSourceBuffer('video/mp2t');
+
+    sourceBuffer.transmuxer_.postMessage = function(segment) {
+      if (segment.action === 'push') {
+        var buffer = new Uint8Array(segment.data, segment.byteOffset, segment.byteLength);
+        mp2tSegments.push(buffer);
+      }
+    };
+
+    sourceBuffer.appendBuffer(data);
+
+    equal(mp2tSegments.length, 1, 'emitted the fragment');
+    equal(mp2tSegments[0].length, 2, 'correctly handled a typed-array that is a subset');
+    equal(mp2tSegments[0][0], 5, 'fragment contains the correct first byte');
+    equal(mp2tSegments[0][1], 6, 'fragment contains the correct second byte');
+
+    // an init segment
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('video', data));
+
+    // Source buffer is not created until after the muxer starts emitting data
+    mediaSource.mediaSource_.sourceBuffers[0].appendBuffer = function(segment) {
+      mp4Segments.push(segment);
+    };
+
+    // Segments are concatenated
+    equal(mp4Segments.length, 0, 'segments are not appended until after the `done` message');
+
+    // send `done` message
+    sourceBuffer.transmuxer_.onmessage(doneMessage);
+
+    // Segments are concatenated
+    equal(mp4Segments.length, 1, 'emitted the fragment');
+    equal(mp4Segments[0].length, 2, 'correctly handled a typed-array that is a subset');
+    equal(mp4Segments[0][0], 5, 'fragment contains the correct first byte');
+    equal(mp4Segments[0][1], 6, 'fragment contains the correct second byte');
   });
 
   test('handles codec strings in reverse order', function() {
@@ -337,15 +426,7 @@
     var mediaSource = new videojs.MediaSource(),
         sourceBuffer = mediaSource.addSourceBuffer('video/mp2t; codecs="avc1.64001f,mp4a.40.5"');
 
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'combined',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('combined', new Uint8Array(1)));
     equal(mediaSource.mediaSource_.sourceBuffers[0].type,
           'video/mp4;codecs="avc1.64001f,mp4a.40.5"',
           'passed the codec along');
@@ -355,15 +436,7 @@
     var mediaSource = new videojs.MediaSource(),
         sourceBuffer = mediaSource.addSourceBuffer('video/mp2t; codecs="avc1.100.31,mp4a.40.5"');
 
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'combined',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('combined', new Uint8Array(1)));
     equal(mediaSource.mediaSource_.sourceBuffers[0].type,
           'video/mp4;codecs="avc1.64001f,mp4a.40.5"',
           'passed the codec along');
@@ -373,15 +446,7 @@
     var mediaSource = new videojs.MediaSource(),
         sourceBuffer = mediaSource.addSourceBuffer('video/mp2t');
 
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'combined',
-          data: new Uint8Array(1).buffer
-        }
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('combined', new Uint8Array(1)));
     equal(mediaSource.mediaSource_.sourceBuffers[0].type,
           'video/mp4;codecs="avc1.4d400d,mp4a.40.2"',
           'passed the codec along');
@@ -429,19 +494,28 @@
     equal(sourceBuffer.buffered.end(1), 30, 'second ends at 30');
   });
 
-  test('sets native timestamp offsets on appends', function(){
+  test('sets transmuxer baseMediaDecodeTime on appends', function(){
     var mediaSource = new videojs.MediaSource(),
-        sourceBuffer = mediaSource.addSourceBuffer('video/mp2t');
+        sourceBuffer = mediaSource.addSourceBuffer('video/mp2t'),
+        resets = [];
+
+    sourceBuffer.transmuxer_.postMessage = function(message) {
+      if (message.action === 'setTimestampOffset') {
+        resets.push(message.timestampOffset);
+      }
+    };
+
     sourceBuffer.timestampOffset = 42;
 
     initializeNativeSourceBuffers(sourceBuffer);
 
-    equal(mediaSource.mediaSource_.sourceBuffers[0].timestampOffset,
+
+    equal(resets.length,
+          1,
+          'reset called');
+    equal(resets[0],
           42,
-          'set the first offset');
-    equal(mediaSource.mediaSource_.sourceBuffers[1].timestampOffset,
-          42,
-          'set the second offset');
+          'set the baseMediaDecodeTime based on timestampOffset');
   });
 
   test('aggregates source buffer update events', function() {
@@ -467,11 +541,7 @@
     equal(updates, 0, 'no updates before a `done` message is received');
     equal(updateends, 0, 'no updateends before a `done` message is received');
 
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'done'
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(doneMessage);
 
     // the video buffer begins updating first:
     sourceBuffer.videoBuffer_.updating = true;
@@ -518,25 +588,14 @@
       }
     };
     sourceBuffer.timestampOffset = 10;
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'video',
-          data: new Uint8Array(1),
-          captions: [{
-            startTime: 1,
-            endTime: 3,
-            text: 'This is an in-band caption'
-          }]
-        }
-      }
-    });
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'done'
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('video', new Uint8Array(1), {
+      captions:[{
+        startTime: 1,
+        endTime: 3,
+        text: 'This is an in-band caption'
+      }]
+    }));
+    sourceBuffer.transmuxer_.onmessage(doneMessage);
 
     equal(types.length, 1, 'created one text track');
     equal(types[0], 'captions', 'the type was captions');
@@ -583,21 +642,10 @@
       }
     };
     sourceBuffer.timestampOffset = 10;
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'data',
-        segment: {
-          type: 'video',
-          data: new Uint8Array(1),
-          metadata: metadata
-        }
-      }
-    });
-    sourceBuffer.transmuxer_.onmessage({
-      data: {
-        action: 'done'
-      }
-    });
+    sourceBuffer.transmuxer_.onmessage(createDataMessage('video', new Uint8Array(1), {
+      metadata: metadata
+    }));
+    sourceBuffer.transmuxer_.onmessage(doneMessage);
 
     equal(
       sourceBuffer.metadataTrack_.inBandMetadataTrackDispatchType,

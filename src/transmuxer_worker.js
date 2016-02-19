@@ -33,10 +33,13 @@ var wireTransmuxerEvents = function (transmuxer) {
     // transfer ownership of the underlying ArrayBuffer instead of doing a copy to save memory
     // ArrayBuffers are transferable but generic TypedArrays are not
     // see https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers#Passing_data_by_transferring_ownership_(transferable_objects)
-    segment.data = segment.data.buffer;
+    var typedArray = segment.data;
+    segment.data = typedArray.buffer;
     postMessage({
       action: 'data',
-      segment: segment
+      segment: segment,
+      byteOffset: typedArray.byteOffset,
+      byteLength: typedArray.byteLength
     }, [segment.data]);
   });
 
@@ -74,6 +77,9 @@ var messageHandlers = {
    * default options if `init` was never explicitly called
    */
   defaultInit: function () {
+    if (transmuxer) {
+      transmuxer.dispose();
+    }
     transmuxer = new muxjs.mp4.Transmuxer(initOptions);
     wireTransmuxerEvents(transmuxer);
   },
@@ -84,17 +90,26 @@ var messageHandlers = {
    */
   push: function (data) {
     // Cast array buffer to correct type for transmuxer
-    var segment = new Uint8Array(data.data);
+    var segment = new Uint8Array(data.data, data.byteOffset, data.byteLength);
     transmuxer.push(segment);
   },
   /**
-   * resetTransmuxer
+   * reset
    * Recreate the transmuxer so that the next segment added via `push`
-   * begins at a baseMediaDecodeTime of 0
+   * start with a fresh transmuxer
    */
-  resetTransmuxer: function (data) {
-    // delete the transmuxer
+  reset: function () {
     this.defaultInit();
+  },
+  /**
+   * setTimestampOffset
+   * Set the value that will be used as the `baseMediaDecodeTime` time for the
+   * next segment pushed in. Subsequent segments will have their `baseMediaDecodeTime`
+   * set relative to the first based on the PTS values.
+   */
+  setTimestampOffset: function (data) {
+    var timestampOffset = data.timestampOffset || 0;
+    transmuxer.setBaseMediaDecodeTime(Math.round(timestampOffset * 90000));
   },
   /**
    * flush
